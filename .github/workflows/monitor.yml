@@ -1,0 +1,63 @@
+name: Monitor de Precios Paris
+
+on:
+  schedule:
+    - cron: '32 * * * *'
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Modo de ejecucion'
+        required: false
+        default: 'once'
+        type: choice
+        options:
+          - once
+          - test
+
+concurrency:
+  group: paris-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Instalar Chromium
+        run: python -m playwright install chromium --with-deps
+
+      - name: Restaurar historial de precios
+        uses: actions/cache@v4
+        with:
+          path: precios.db
+          key: precios-db
+
+      - name: Correr monitor
+        env:
+          NTFY_TEMA: ${{ secrets.NTFY_TEMA }}
+          URLS: ${{ secrets.URLS }}
+        run: python monitor.py --${{ github.event.inputs.modo || 'once' }}
+
+      - name: Mantener repo activo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          date -u > ultimo_chequeo.txt
+          git add ultimo_chequeo.txt
+          git diff --staged --quiet || git commit -m "ultimo chequeo: $(date -u)"
+          git push
