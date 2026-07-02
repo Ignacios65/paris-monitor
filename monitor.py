@@ -149,6 +149,12 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
     except ImportError:
         sys.exit("Falta Playwright.")
 
+    try:
+        from playwright_stealth import stealth_sync
+        use_stealth = True
+    except ImportError:
+        use_stealth = False
+
     payloads = []
 
     def on_response(resp):
@@ -161,7 +167,7 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
             pass
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = pw.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -170,9 +176,12 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
             viewport={"width": 1366, "height": 900},
         )
         page = ctx.new_page()
+        if use_stealth:
+            stealth_sync(page)
         page.on("response", on_response)
         try:
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(5000)
         except Exception as e:
             print(f"  ! aviso al cargar {url}: {e}")
         try:
