@@ -184,10 +184,33 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
             page.wait_for_timeout(5000)
         except Exception as e:
             print(f"  ! aviso al cargar {url}: {e}")
+        # Scroll infinito: seguir bajando hasta que no aparezcan productos nuevos
         try:
-            for _ in range(3):
-                page.mouse.wheel(0, 4000)
-                page.wait_for_timeout(1200)
+            prev_count = 0
+            sin_cambio = 0
+            for _ in range(20):
+                page.mouse.wheel(0, 5000)
+                page.wait_for_timeout(2000)
+                count = page.evaluate("""() => {
+                    const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+                    for (const s of scripts) {
+                        try {
+                            const data = JSON.parse(s.textContent);
+                            const entity = data.mainEntity || data;
+                            if (entity['@type'] === 'ItemList' && entity.itemListElement)
+                                return entity.itemListElement.length;
+                        } catch(e) {}
+                    }
+                    // fallback: contar cards visibles en el DOM
+                    return document.querySelectorAll('[class*="pod-product"],[class*="product-card"],.pod').length;
+                }""")
+                if count == prev_count:
+                    sin_cambio += 1
+                    if sin_cambio >= 3:
+                        break  # 3 scrolls sin nuevos productos = llegamos al final
+                else:
+                    sin_cambio = 0
+                prev_count = count
         except Exception:
             pass
 
@@ -486,58 +509,39 @@ def enviar_ntfy(cfg, titulo, cuerpo, url_producto="", super_alerta=False):
 #  CICLO PRINCIPAL
 # ------------------------------------------------------------------ #
 
-def url_pagina(base, n):
-    """Construye la URL de la pagina N: base/?page=N (o base/ si n==1)."""
-    b = base.rstrip("/") + "/"
-    return b if n == 1 else f"{b}?page={n}"
-
-
 def revisar_una_vez(con, cfg):
     total, alertas = 0, 0
-    max_paginas = cfg.get("max_paginas", 10)
     headless = cfg.get("headless", True)
     pausa = cfg.get("pausa_entre_urls_seg", 5)
 
-    for url_base in cfg["urls"]:
-        vistos_url = set()
-        for pagina in range(1, max_paginas + 1):
-            url = url_pagina(url_base, pagina)
-            print(f"[{datetime.now():%H:%M:%S}] Revisando: {url}")
-            productos = []
-            for payload in fetch_payloads(url, headless=headless):
-                productos.extend(extraer_productos(payload))
+    for url in cfg["urls"]:
+        print(f"[{datetime.now():%H:%M:%S}] Revisando: {url}")
+        productos = []
+        for payload in fetch_payloads(url, headless=headless):
+            productos.extend(extraer_productos(payload))
+        unicos = list({p["sku"]: p for p in productos}.values())
+        print(f"  -> {len(unicos)} productos detectados")
 
-            # Filtrar solo productos nuevos (no vistos en paginas anteriores de esta URL)
-            nuevos = [p for p in productos if p["sku"] not in vistos_url]
-            for p in nuevos:
-                vistos_url.add(p["sku"])
+        for prod in unicos:
+            total += 1
+            registrar_precio(con, prod)
+            resultado = evaluar(con, prod, cfg)
+            if resultado:
+                nivel, motivo = resultado
+                clave = f"{prod['sku']}@{prod['precio']}"
+                if not ya_alertado(con, clave):
+                    marcar_alertado(con, clave)
+                    alertas += 1
+                    if nivel == "super":
+                        titulo = f"POSIBLE ERROR DE PRECIO: {prod['nombre'][:45]}"
+                    else:
+                        titulo = f"Oferta interesante: {prod['nombre'][:50]}"
+                    cuerpo = (f"Precio: ${prod['precio']:,}\n"
+                              f"{motivo}").replace(",", ".")
+                    enviar_ntfy(cfg, titulo, cuerpo, prod.get("url", ""), super_alerta=(nivel == "super"))
+                    print(f"  ALERTA ({nivel}): {prod['nombre']} -> ${prod['precio']}")
 
-            print(f"  -> {len(nuevos)} productos nuevos (pagina {pagina})")
-
-            if not nuevos:
-                # Pagina vacia: no hay mas paginas en esta categoria
-                break
-
-            for prod in nuevos:
-                total += 1
-                registrar_precio(con, prod)
-                resultado = evaluar(con, prod, cfg)
-                if resultado:
-                    nivel, motivo = resultado
-                    clave = f"{prod['sku']}@{prod['precio']}"
-                    if not ya_alertado(con, clave):
-                        marcar_alertado(con, clave)
-                        alertas += 1
-                        if nivel == "super":
-                            titulo = f"POSIBLE ERROR DE PRECIO: {prod['nombre'][:45]}"
-                        else:
-                            titulo = f"Oferta interesante: {prod['nombre'][:50]}"
-                        cuerpo = (f"Precio: ${prod['precio']:,}\n"
-                                  f"{motivo}").replace(",", ".")
-                        enviar_ntfy(cfg, titulo, cuerpo, prod.get("url", ""), super_alerta=(nivel == "super"))
-                        print(f"  ALERTA ({nivel}): {prod['nombre']} -> ${prod['precio']}")
-
-            time.sleep(pausa)
+        time.sleep(pausa)
 
     print(f"  Resumen: {total} productos, {alertas} alertas nuevas\n")
 
