@@ -243,8 +243,6 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                             ));
 
                             return items.map((p, i) => {
-                                const precio = p.offers.price;
-
                                 // 1) buscar por SKU en atributos data del card
                                 const sku = String(p.sku || '');
                                 let pod = sku
@@ -256,7 +254,26 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                                 // 2) si no encontro por SKU, usar posicion
                                 if (!pod) pod = pods[i] || null;
 
-                                // 3) buscar .ui-line-through dentro del card
+                                // 3) precio base desde schema.org
+                                let precio = p.offers.price;
+
+                                // 4) si el card muestra precio por unidad ("x un"),
+                                //    el schema.org trae el precio/unidad en vez del pack.
+                                //    Buscar el precio total del pack en el card.
+                                if (pod) {
+                                    const podText = pod.textContent || '';
+                                    if (podText.includes('x un')) {
+                                        const allPrices = Array.from(podText.matchAll(/\\$(\\s*[\\d.]+)/g))
+                                            .map(m => parseInt(m[1].replace(/\\./g, '')))
+                                            .filter(v => v >= 1000);
+                                        // El precio del pack es mayor al per-unit pero menor al normal
+                                        const packCandidates = allPrices.filter(v => v > precio);
+                                        if (packCandidates.length > 0)
+                                            precio = Math.min(...packCandidates);
+                                    }
+                                }
+
+                                // 5) buscar precio normal tachado dentro del card
                                 const normalEl = pod
                                     ? pod.querySelector('.ui-line-through')
                                     : null;
@@ -267,7 +284,7 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                                     ? parseInt(normalRaw.replace(/[^\\d]/g, ''))
                                     : null;
 
-                                // Sanidad: si normal > 8x el precio de oferta, es un mismatch
+                                // Sanidad: si normal > 8x el precio, es mismatch
                                 if (normal && normal > precio * 8) normal = null;
 
                                 return {
