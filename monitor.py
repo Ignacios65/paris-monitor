@@ -211,17 +211,47 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                             const items = entity.itemListElement
                                 .map(item => item.item || item)
                                 .filter(p => p.offers && p.offers.price);
-                            // Precio tachado (precio normal) desde el DOM
-                            const normalEls = Array.from(document.querySelectorAll('.ui-line-through'))
-                                .filter(el => el.textContent.trim().startsWith('$'));
+
+                            // Buscar cards de producto en el DOM para extraer precio tachado
+                            // dentro del card especifico (evita desalineacion de indices)
+                            const pods = Array.from(document.querySelectorAll(
+                                '[class*="pod-product"], [class*="productPod"], ' +
+                                '[class*="product-card"], [class*="pod_product"], .pod'
+                            ));
+
                             return items.map((p, i) => {
-                                const normalRaw = normalEls[i] ? normalEls[i].textContent.trim() : null;
-                                const normal = normalRaw ? parseInt(normalRaw.replace(/[^\\d]/g, '')) : p.offers.price;
+                                const precio = p.offers.price;
+
+                                // 1) buscar por SKU en atributos data del card
+                                const sku = String(p.sku || '');
+                                let pod = sku
+                                    ? document.querySelector(
+                                        '[data-id="' + sku + '"], [data-sku="' + sku + '"], ' +
+                                        '[data-product-id="' + sku + '"]')
+                                    : null;
+
+                                // 2) si no encontro por SKU, usar posicion
+                                if (!pod) pod = pods[i] || null;
+
+                                // 3) buscar .ui-line-through dentro del card
+                                const normalEl = pod
+                                    ? pod.querySelector('.ui-line-through')
+                                    : null;
+                                const normalRaw = normalEl
+                                    ? normalEl.textContent.trim()
+                                    : null;
+                                let normal = normalRaw
+                                    ? parseInt(normalRaw.replace(/[^\\d]/g, ''))
+                                    : null;
+
+                                // Sanidad: si normal > 8x el precio de oferta, es un mismatch
+                                if (normal && normal > precio * 8) normal = null;
+
                                 return {
                                     sku: p.sku || p.name,
                                     nombre: p.name,
-                                    precio: p.offers.price,
-                                    normal: normal,
+                                    precio: precio,
+                                    normal: normal || precio,
                                     url: p.url || p.offers.url || ''
                                 };
                             });
