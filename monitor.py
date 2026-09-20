@@ -116,65 +116,155 @@ def marcar_alertado(con, clave):
 
 
 # ------------------------------------------------------------------ #
-#  PARIS — API JSON directa (sin Playwright)
+#  PARIS — Playwright con parametro commune (clave para ver productos)
 # ------------------------------------------------------------------ #
 
-PARIS_API = "https://be-paris-backend-cl-ms-search.ccom.paris.cl/products/"
+# commune=09101 es Temuco — sin este parametro Paris muestra 0 productos
+PARIS_COMMUNE = os.environ.get("PARIS_COMMUNE", "09101")
 
 
-def fetch_paris(termino, max_paginas=3):
-    """Consulta el API JSON de Paris directamente, sin Playwright."""
+def fetch_paris(termino, headless=True):
+    """Abre Paris con Playwright usando el parametro commune para ver productos."""
+    url = f"https://www.paris.cl/search/?q={requests.utils.quote(termino)}&commune={PARIS_COMMUNE}"
     productos = []
-    vistos = set()
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0 Safari/537.36"),
-        "Accept": "application/json",
-        "Referer": "https://www.paris.cl/",
-    }
-    for pagina in range(1, max_paginas + 1):
-        try:
-            r = requests.get(
-                PARIS_API,
-                params={"term": termino, "page": pagina, "pageSize": 50},
-                headers=headers,
-                timeout=20,
-            )
-            if not r.ok:
-                break
-            data = r.json()
-            items = data.get("products") or data.get("items") or data.get("results") or []
-            if not items:
-                for k, v in data.items():
-                    if isinstance(v, list) and v and isinstance(v[0], dict):
-                        items = v
-                        break
-            if not items:
-                break
-            for p in items:
-                sku = str(p.get("sku") or p.get("productId") or p.get("id") or "")
-                if not sku or sku in vistos:
-                    continue
-                vistos.add(sku)
-                precio = p.get("price") or p.get("currentPrice") or p.get("salePrice")
-                normal = p.get("originalPrice") or p.get("normalPrice") or precio
-                nombre = p.get("title") or p.get("name") or p.get("displayName") or ""
-                url    = p.get("url") or p.get("productUrl") or ""
-                if url and url.startswith("/"):
-                    url = "https://www.paris.cl" + url
-                if nombre and precio:
-                    productos.append({
-                        "sku":    f"paris_{sku}",
-                        "nombre": str(nombre)[:120],
-                        "precio": int(precio),
-                        "normal": int(normal) if normal else int(precio),
-                        "url":    url,
-                    })
-        except Exception as e:
-            print(f"  ! Error Paris ({termino} p{pagina}): {e}")
-            break
+
+    payloads = fetch_payloads(url, headless=headless)
+    for payload in payloads:
+        productos.extend(extraer_productos_paris(payload))
+
+    # Si Playwright no encontro productos via JSON, extraer del schema.org
+    if not productos:
+        productos = fetch_paris_schema(url, headless=headless)
+
     return productos
+
+
+def fetch_paris_schema(url, headless=True):
+    """Extrae productos de Paris desde schema.org y precios del DOM."""
+    ensure_chromium()
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    productos = []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=headless,
+                                         args=["--disable-blink-features=AutomationControlled"])
+            ctx = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36"),
+                locale="es-CL",
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(5000)
+                # Scroll para cargar mas productos
+                for _ in range(5):
+                    page.mouse.wheel(0, 5000)
+                    page.wait_for_timeout(1500)
+            except Exception as e:
+                print(f"  ! aviso Paris: {e}")
+
+            try:
+                raw = page.evaluate("""() => {
+                    const results = [];
+                    // Buscar links de productos
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        const href = a.href || '';
+                        if (!href.includes('paris.cl')) return;
+                        const text = a.innerText || '';
+                        const prices = text.match(/\$[\d\.]+/g);
+                        if (!prices || prices.length === 0) return;
+                        if (text.length < 10 || text.length > 500) return;
+                        results.push({href, text, prices});
+                    });
+                    return results;
+                }""")
+                vistos = set()
+                for item in (raw or []):
+                    href = item.get("href", "")
+                    text = item.get("text", "")
+                    prices_raw = item.get("prices", [])
+                    precios = []
+                    for p in prices_raw:
+                        d = re.sub(r"[^\d]", "", p)
+                        if d and int(d) >= 1000:
+                            precios.append(int(d))
+                    if not precios:
+                        continue
+                    # Extraer nombre limpiando precios del texto
+                    nombre = text
+                    for p in prices_raw:
+                        nombre = nombre.replace(p, "")
+                    nombre = re.sub(r"\s+", " ", nombre).strip()[:100]
+                    if len(nombre) < 5:
+                        continue
+                    sku = re.sub(r"[^\w]", "", href.split("/")[-1])[:50] or nombre[:30]
+                    key = f"paris_{sku}"
+                    if key in vistos:
+                        continue
+                    vistos.add(key)
+                    productos.append({
+                        "sku":    key,
+                        "nombre": nombre,
+                        "precio": min(precios),
+                        "normal": max(precios),
+                        "url":    href,
+                    })
+            except Exception as e:
+                print(f"  ! Error extrayendo Paris DOM: {e}")
+
+            browser.close()
+    except Exception as e:
+        print(f"  ! Error Playwright Paris: {e}")
+
+    return productos
+
+
+def extraer_productos_paris(obj, encontrados=None, vistos=None):
+    """Parser especifico para la estructura JSON de Paris."""
+    if encontrados is None:
+        encontrados, vistos = [], set()
+    if isinstance(obj, dict):
+        # Paris usa 'displayName' y precios en lista 'prices'
+        nombre = obj.get("displayName") or obj.get("name") or obj.get("title")
+        sku = str(obj.get("skuId") or obj.get("productId") or obj.get("sku") or obj.get("id") or "")
+        prices = obj.get("prices") or []
+        precio, normal = None, None
+        if isinstance(prices, list):
+            vals = []
+            for p in prices:
+                if isinstance(p, dict):
+                    v = normalizar_precio(p.get("price"))
+                    if v:
+                        vals.append(v)
+            if vals:
+                precio, normal = min(vals), max(vals)
+        if not precio:
+            precio = normalizar_precio(obj.get("price") or obj.get("currentPrice"))
+            normal = normalizar_precio(obj.get("originalPrice") or obj.get("normalPrice")) or precio
+        if nombre and precio and sku and sku not in vistos:
+            vistos.add(sku)
+            url = obj.get("url") or obj.get("productUrl") or ""
+            if url and url.startswith("/"):
+                url = "https://www.paris.cl" + url
+            encontrados.append({
+                "sku":    f"paris_{sku}",
+                "nombre": str(nombre)[:120],
+                "precio": precio,
+                "normal": normal or precio,
+                "url":    url,
+            })
+        for v in obj.values():
+            extraer_productos_paris(v, encontrados, vistos)
+    elif isinstance(obj, list):
+        for v in obj:
+            extraer_productos_paris(v, encontrados, vistos)
+    return encontrados
 
 
 # ------------------------------------------------------------------ #
@@ -507,10 +597,10 @@ def revisar_una_vez(con, cfg):
     total, alertas = 0, 0
     pausa = cfg.get("pausa_entre_urls_seg", 5)
 
-    # --- Paris (API directa) ---
+    # --- Paris (Playwright con commune) ---
     for termino in cfg.get("paris_terminos", []):
         print(f"[{datetime.now():%H:%M:%S}] Paris: {termino}")
-        productos = fetch_paris(termino)
+        productos = fetch_paris(termino, headless=cfg.get("headless", True))
         unicos = list({p["sku"]: p for p in productos}.values())
         print(f"  -> {len(unicos)} productos detectados")
         total += len(unicos)
@@ -557,5 +647,7 @@ def main():
         except Exception as e:
             print(f"  ! Error en el ciclo: {e}")
         time.sleep(intervalo * 60)
+
+
 if __name__ == "__main__":
     main()
