@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitor de precios de Falabella con alertas via ntfy.sh
+Monitor de precios Paris.cl + Falabella con alertas via ntfy.sh
 """
 
 import json
@@ -23,39 +23,42 @@ CONFIG_PATH = os.environ.get("FALABELLA_CONFIG", "config.json")
 
 
 def load_config():
-    # Si existe config.json lo carga, si no construye la config desde variables de entorno
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, encoding="utf-8") as f:
             cfg = json.load(f)
     else:
         cfg = {}
 
-    # Variables de entorno tienen prioridad sobre el archivo
     cfg["ntfy_tema"] = os.environ.get("NTFY_TEMA", cfg.get("ntfy_tema", ""))
 
-    # URLs desde variable de entorno (separadas por coma) o desde el archivo
     urls_env = os.environ.get("URLS", "")
     if urls_env:
         cfg["urls"] = [u.strip() for u in urls_env.split(",") if u.strip()]
+    cfg.setdefault("urls", [])
 
-    # Valores por defecto para el resto de opciones
+    paris_env = os.environ.get("PARIS_TERMINOS", "")
+    if paris_env:
+        cfg["paris_terminos"] = [t.strip() for t in paris_env.split(",") if t.strip()]
+    cfg.setdefault("paris_terminos", [])
+
     cfg.setdefault("intervalo_minutos", int(os.environ.get("INTERVALO_MINUTOS", 30)))
-    cfg.setdefault("umbral_descuento", float(os.environ.get("UMBRAL_DESCUENTO", 0.80)))
-    cfg.setdefault("umbral_caida", float(os.environ.get("UMBRAL_CAIDA", 0.60)))
+    cfg.setdefault("umbral_error",      float(os.environ.get("UMBRAL_ERROR", 0.80)))
+    cfg.setdefault("umbral_descuento",  float(os.environ.get("UMBRAL_DESCUENTO", 0.65)))
+    cfg.setdefault("umbral_caida",      float(os.environ.get("UMBRAL_CAIDA", 0.60)))
     cfg.setdefault("precio_minimo_clp", int(os.environ.get("PRECIO_MINIMO_CLP", 1000)))
-    cfg.setdefault("min_muestras", int(os.environ.get("MIN_MUESTRAS", 5)))
+    cfg.setdefault("min_muestras",      int(os.environ.get("MIN_MUESTRAS", 5)))
     cfg.setdefault("pausa_entre_urls_seg", int(os.environ.get("PAUSA_ENTRE_URLS_SEG", 5)))
     cfg.setdefault("headless", True)
 
     if not cfg.get("ntfy_tema") or "PEGA_AQUI" in cfg["ntfy_tema"]:
         sys.exit("Falta el tema de ntfy. Configura la variable de entorno NTFY_TEMA.")
-    if not cfg.get("urls"):
-        sys.exit("No hay URLs para monitorear. Configura la variable de entorno URLS.")
+    if not cfg.get("urls") and not cfg.get("paris_terminos"):
+        sys.exit("No hay URLs ni terminos de Paris configurados.")
     return cfg
 
 
 # ------------------------------------------------------------------ #
-#  BASE DE DATOS (historial de precios + alertas ya enviadas)
+#  BASE DE DATOS
 # ------------------------------------------------------------------ #
 
 DB_PATH = os.environ.get("FALABELLA_DB", "precios.db")
@@ -113,16 +116,76 @@ def marcar_alertado(con, clave):
 
 
 # ------------------------------------------------------------------ #
-#  OBTENCIÓN DE DATOS (Playwright intercepta el JSON de la web)
+#  PARIS — API JSON directa (sin Playwright)
+# ------------------------------------------------------------------ #
+
+PARIS_API = "https://be-paris-backend-cl-ms-search.ccom.paris.cl/products/"
+
+
+def fetch_paris(termino, max_paginas=3):
+    """Consulta el API JSON de Paris directamente, sin Playwright."""
+    productos = []
+    vistos = set()
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0 Safari/537.36"),
+        "Accept": "application/json",
+        "Referer": "https://www.paris.cl/",
+    }
+    for pagina in range(1, max_paginas + 1):
+        try:
+            r = requests.get(
+                PARIS_API,
+                params={"term": termino, "page": pagina, "pageSize": 50},
+                headers=headers,
+                timeout=20,
+            )
+            if not r.ok:
+                break
+            data = r.json()
+            items = data.get("products") or data.get("items") or data.get("results") or []
+            if not items:
+                for k, v in data.items():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        items = v
+                        break
+            if not items:
+                break
+            for p in items:
+                sku = str(p.get("sku") or p.get("productId") or p.get("id") or "")
+                if not sku or sku in vistos:
+                    continue
+                vistos.add(sku)
+                precio = p.get("price") or p.get("currentPrice") or p.get("salePrice")
+                normal = p.get("originalPrice") or p.get("normalPrice") or precio
+                nombre = p.get("title") or p.get("name") or p.get("displayName") or ""
+                url    = p.get("url") or p.get("productUrl") or ""
+                if url and url.startswith("/"):
+                    url = "https://www.paris.cl" + url
+                if nombre and precio:
+                    productos.append({
+                        "sku":    f"paris_{sku}",
+                        "nombre": str(nombre)[:120],
+                        "precio": int(precio),
+                        "normal": int(normal) if normal else int(precio),
+                        "url":    url,
+                    })
+        except Exception as e:
+            print(f"  ! Error Paris ({termino} p{pagina}): {e}")
+            break
+    return productos
+
+
+# ------------------------------------------------------------------ #
+#  FALABELLA — Playwright (intercepta JSON de la web)
 # ------------------------------------------------------------------ #
 
 def ensure_chromium():
-    """Instala Chromium automaticamente si no esta disponible (necesario en Railway)."""
     import subprocess
     chromium_path = os.path.expanduser("~/.cache/ms-playwright")
     alt_path = "/ms-playwright"
     path = chromium_path if os.path.exists(chromium_path) else alt_path
-    # busca si ya hay algun ejecutable de chromium
     found = False
     for root, dirs, files in os.walk(path):
         for f in files:
@@ -133,10 +196,7 @@ def ensure_chromium():
             break
     if not found:
         print("Chromium no encontrado, instalando...")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True
-        )
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
         print("Chromium instalado OK")
     else:
         print("Chromium ya instalado, continuando...")
@@ -167,7 +227,8 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
             pass
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
+        browser = pw.chromium.launch(headless=headless,
+                                     args=["--disable-blink-features=AutomationControlled"])
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -184,7 +245,6 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
             page.wait_for_timeout(5000)
         except Exception as e:
             print(f"  ! aviso al cargar {url}: {e}")
-        # Scroll infinito: seguir bajando hasta que no aparezcan productos nuevos
         try:
             prev_count = 0
             sin_cambio = 0
@@ -201,20 +261,18 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                                 return entity.itemListElement.length;
                         } catch(e) {}
                     }
-                    // fallback: contar cards visibles en el DOM
                     return document.querySelectorAll('[class*="pod-product"],[class*="product-card"],.pod').length;
                 }""")
                 if count == prev_count:
                     sin_cambio += 1
                     if sin_cambio >= 3:
-                        break  # 3 scrolls sin nuevos productos = llegamos al final
+                        break
                 else:
                     sin_cambio = 0
                 prev_count = count
         except Exception:
             pass
 
-        # Plan B: datos embebidos en __NEXT_DATA__ (Next.js)
         try:
             nxt = page.eval_on_selector("#__NEXT_DATA__", "el => el.textContent")
             if nxt:
@@ -222,7 +280,6 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
         except Exception:
             pass
 
-        # Plan B2: schema.org ItemList + precio normal del DOM (Paris.cl y similares)
         try:
             schema_products = page.evaluate("""() => {
                 const scripts = Array.from(document.querySelectorAll('script:not([src])'));
@@ -234,59 +291,31 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
                             const items = entity.itemListElement
                                 .map(item => item.item || item)
                                 .filter(p => p.offers && p.offers.price);
-
-                            // Buscar cards de producto en el DOM para extraer precio tachado
-                            // dentro del card especifico (evita desalineacion de indices)
                             const pods = Array.from(document.querySelectorAll(
                                 '[class*="pod-product"], [class*="productPod"], ' +
                                 '[class*="product-card"], [class*="pod_product"], .pod'
                             ));
-
                             return items.map((p, i) => {
-                                // 1) buscar por SKU en atributos data del card
                                 const sku = String(p.sku || '');
-                                let pod = sku
-                                    ? document.querySelector(
-                                        '[data-id="' + sku + '"], [data-sku="' + sku + '"], ' +
-                                        '[data-product-id="' + sku + '"]')
-                                    : null;
-
-                                // 2) si no encontro por SKU, usar posicion
+                                let pod = sku ? document.querySelector(
+                                    '[data-id="' + sku + '"], [data-sku="' + sku + '"]') : null;
                                 if (!pod) pod = pods[i] || null;
-
-                                // 3) precio base desde schema.org
                                 let precio = p.offers.price;
-
-                                // 4) si el card muestra precio por unidad ("x un"),
-                                //    el schema.org trae el precio/unidad en vez del pack.
-                                //    Buscar el precio total del pack en el card.
                                 if (pod) {
                                     const podText = pod.textContent || '';
                                     if (podText.includes('x un')) {
                                         const allPrices = Array.from(podText.matchAll(/\\$(\\s*[\\d.]+)/g))
                                             .map(m => parseInt(m[1].replace(/\\./g, '')))
                                             .filter(v => v >= 1000);
-                                        // El precio del pack es mayor al per-unit pero menor al normal
                                         const packCandidates = allPrices.filter(v => v > precio);
                                         if (packCandidates.length > 0)
                                             precio = Math.min(...packCandidates);
                                     }
                                 }
-
-                                // 5) buscar precio normal tachado dentro del card
-                                const normalEl = pod
-                                    ? pod.querySelector('.ui-line-through')
-                                    : null;
-                                const normalRaw = normalEl
-                                    ? normalEl.textContent.trim()
-                                    : null;
-                                let normal = normalRaw
-                                    ? parseInt(normalRaw.replace(/[^\\d]/g, ''))
-                                    : null;
-
-                                // Sanidad: si normal > 8x el precio, es mismatch
+                                const normalEl = pod ? pod.querySelector('.ui-line-through') : null;
+                                const normalRaw = normalEl ? normalEl.textContent.trim() : null;
+                                let normal = normalRaw ? parseInt(normalRaw.replace(/[^\\d]/g, '')) : null;
                                 if (normal && normal > precio * 8) normal = null;
-
                                 return {
                                     sku: p.sku || p.name,
                                     nombre: p.name,
@@ -305,33 +334,12 @@ def fetch_payloads(url, timeout_ms=45000, headless=True):
         except Exception:
             pass
 
-        # Plan C: extraer productos del DOM (para tiendas que renderizan en HTML)
-        try:
-            dom_products = page.evaluate("""() => {
-                const results = [];
-                const links = document.querySelectorAll('a[href]');
-                for (const a of links) {
-                    const text = a.textContent || '';
-                    if (!text.includes('$') || text.length > 600 || text.length < 20) continue;
-                    const priceMatches = text.match(/\\$[\\d.,]+/g);
-                    if (!priceMatches || priceMatches.length === 0) continue;
-                    const href = a.href || '';
-                    if (!href.includes('.cl/') && !href.includes('.com/')) continue;
-                    results.push({href: href, text: text});
-                }
-                return results;
-            }""")
-            if dom_products:
-                payloads.append({"_dom_products": dom_products})
-        except Exception:
-            pass
-
         browser.close()
     return payloads
 
 
 # ------------------------------------------------------------------ #
-#  PARSER: extrae productos de cualquier estructura JSON encontrada
+#  PARSER
 # ------------------------------------------------------------------ #
 
 NAME_KEYS = ("displayName", "productName", "name", "title")
@@ -375,59 +383,15 @@ def first_key(d, keys):
     return None
 
 
-def parsear_dom_product(item):
-    text = item.get("text", "")
-    href = item.get("href", "")
-    precios_raw = re.findall(r"\$\d{1,3}(?:\.\d{3})+", text)
-    if not precios_raw:
-        return None
-    precios = []
-    for p in precios_raw:
-        digitos = re.sub(r"[^\d]", "", p)
-        if digitos:
-            precios.append(int(digitos))
-    precios = [p for p in precios if p >= 1000]
-    if not precios:
-        return None
-    for pat in precios_raw:
-        text = text.replace(pat, " ")
-    nombre = re.sub(r"\s+", " ", text).strip()
-    for basura in ("Vista Previa", "Agregar al carro", "Despacho Gratis",
-                   "Retiro en tienda", "Ver producto", "Añadir", "Agregar",
-                   "cuotas sin interés", "6 cuotas sin interés"):
-        nombre = nombre.replace(basura, "")
-    nombre = re.sub(r"\d+%", "", nombre)
-    nombre = re.sub(r"\(\d+\)", "", nombre)
-    nombre = re.sub(r"\s+", " ", nombre).strip()
-    if len(nombre) < 5:
-        return None
-    sku = re.sub(r"[^\w]", "", href.split("/")[-1])[:60] or nombre
-    return {
-        "sku": sku,
-        "nombre": nombre[:120],
-        "precio": min(precios),
-        "normal": max(precios),
-        "url": href,
-    }
-
-
 def extraer_productos(obj, encontrados=None, vistos=None):
     if encontrados is None:
         encontrados, vistos = [], set()
 
     if isinstance(obj, dict) and "_schema_products" in obj:
         for item in obj["_schema_products"]:
-            if item.get("sku") and item.get("sku") not in vistos:
+            if item.get("sku") and item["sku"] not in vistos:
                 vistos.add(item["sku"])
                 encontrados.append(item)
-        return encontrados
-
-    if isinstance(obj, dict) and "_dom_products" in obj:
-        for item in obj["_dom_products"]:
-            prod = parsear_dom_product(item)
-            if prod and prod["sku"] not in vistos:
-                vistos.add(prod["sku"])
-                encontrados.append(prod)
         return encontrados
 
     if isinstance(obj, dict):
@@ -456,18 +420,16 @@ def extraer_productos(obj, encontrados=None, vistos=None):
 
 
 # ------------------------------------------------------------------ #
-#  DETECCIÓN DE POSIBLES ERRORES DE PRECIO
+#  DETECCIÓN DE ERRORES DE PRECIO
 # ------------------------------------------------------------------ #
 
 def evaluar(con, prod, cfg):
     precio, normal = prod["precio"], prod["normal"]
-    if precio <= 0:
-        return None
-    if precio < cfg.get("precio_minimo_clp", 1000):
+    if precio <= 0 or precio < cfg.get("precio_minimo_clp", 1000):
         return None
 
     motivos = []
-    nivel = None  # "super" o "normal"
+    nivel = None
 
     if normal and normal > 0:
         desc = 1 - precio / normal
@@ -478,8 +440,7 @@ def evaluar(con, prod, cfg):
         elif desc >= cfg.get("umbral_descuento", 0.65):
             motivos.append(f"{desc*100:.0f}% bajo el precio normal "
                            f"(${normal:,} -> ${precio:,})".replace(",", "."))
-            if nivel is None:
-                nivel = "normal"
+            nivel = "normal"
 
     ref = precio_referencia(con, prod["sku"], cfg.get("min_muestras", 5))
     if ref:
@@ -490,9 +451,7 @@ def evaluar(con, prod, cfg):
             if nivel is None:
                 nivel = "normal"
 
-    if not motivos:
-        return None
-    return nivel, " | ".join(motivos)
+    return (nivel, " | ".join(motivos)) if motivos else None
 
 
 # ------------------------------------------------------------------ #
@@ -504,68 +463,78 @@ def enviar_ntfy(cfg, titulo, cuerpo, url_producto="", super_alerta=False):
     headers = {
         "Title":    titulo.encode("utf-8"),
         "Priority": "max" if super_alerta else "high",
-        "Tags":     "rotating_light,rotating_light,fire,moneybag" if super_alerta else "moneybag",
+        "Tags":     "rotating_light,fire,moneybag" if super_alerta else "moneybag",
     }
     if url_producto:
         headers["Click"] = url_producto
-
     try:
-        r = requests.post(
-            f"https://ntfy.sh/{tema}",
-            data=cuerpo.encode("utf-8"),
-            headers=headers,
-            timeout=20,
-        )
+        r = requests.post(f"https://ntfy.sh/{tema}",
+                          data=cuerpo.encode("utf-8"),
+                          headers=headers, timeout=20)
         if not r.ok:
-            print(f"  ! ntfy respondio {r.status_code}: {r.text[:200]}")
+            print(f"  ! ntfy {r.status_code}: {r.text[:200]}")
     except Exception as e:
-        print(f"  ! Error enviando a ntfy: {e}")
+        print(f"  ! Error ntfy: {e}")
 
 
 # ------------------------------------------------------------------ #
 #  CICLO PRINCIPAL
 # ------------------------------------------------------------------ #
 
+def procesar_productos(con, cfg, productos, prefijo=""):
+    alertas = 0
+    for prod in productos:
+        registrar_precio(con, prod)
+        resultado = evaluar(con, prod, cfg)
+        if resultado:
+            nivel, motivo = resultado
+            clave = f"{prod['sku']}@{prod['precio']}"
+            if not ya_alertado(con, clave):
+                marcar_alertado(con, clave)
+                alertas += 1
+                if nivel == "super":
+                    titulo = f"{prefijo}ERROR PRECIO: {prod['nombre'][:45]}"
+                else:
+                    titulo = f"{prefijo}Oferta: {prod['nombre'][:50]}"
+                cuerpo = (f"Precio: ${prod['precio']:,}\n{motivo}").replace(",", ".")
+                enviar_ntfy(cfg, titulo, cuerpo, prod.get("url", ""),
+                            super_alerta=(nivel == "super"))
+                print(f"  ALERTA ({nivel}): {prod['nombre']} -> ${prod['precio']}")
+    return alertas
+
+
 def revisar_una_vez(con, cfg):
     total, alertas = 0, 0
-    headless = cfg.get("headless", True)
     pausa = cfg.get("pausa_entre_urls_seg", 5)
 
-    for url in cfg["urls"]:
+    # --- Paris (API directa) ---
+    for termino in cfg.get("paris_terminos", []):
+        print(f"[{datetime.now():%H:%M:%S}] Paris: {termino}")
+        productos = fetch_paris(termino)
+        unicos = list({p["sku"]: p for p in productos}.values())
+        print(f"  -> {len(unicos)} productos detectados")
+        total += len(unicos)
+        alertas += procesar_productos(con, cfg, unicos, prefijo="PARIS ")
+        time.sleep(pausa)
+
+    # --- Falabella (Playwright) ---
+    for url in cfg.get("urls", []):
         print(f"[{datetime.now():%H:%M:%S}] Revisando: {url}")
         productos = []
-        for payload in fetch_payloads(url, headless=headless):
+        for payload in fetch_payloads(url, headless=cfg.get("headless", True)):
             productos.extend(extraer_productos(payload))
         unicos = list({p["sku"]: p for p in productos}.values())
         print(f"  -> {len(unicos)} productos detectados")
-
-        for prod in unicos:
-            total += 1
-            registrar_precio(con, prod)
-            resultado = evaluar(con, prod, cfg)
-            if resultado:
-                nivel, motivo = resultado
-                clave = f"{prod['sku']}@{prod['precio']}"
-                if not ya_alertado(con, clave):
-                    marcar_alertado(con, clave)
-                    alertas += 1
-                    if nivel == "super":
-                        titulo = f"POSIBLE ERROR DE PRECIO: {prod['nombre'][:45]}"
-                    else:
-                        titulo = f"Oferta interesante: {prod['nombre'][:50]}"
-                    cuerpo = (f"Precio: ${prod['precio']:,}\n"
-                              f"{motivo}").replace(",", ".")
-                    enviar_ntfy(cfg, titulo, cuerpo, prod.get("url", ""), super_alerta=(nivel == "super"))
-                    print(f"  ALERTA ({nivel}): {prod['nombre']} -> ${prod['precio']}")
-
+        total += len(unicos)
+        alertas += procesar_productos(con, cfg, unicos)
         time.sleep(pausa)
 
     print(f"  Resumen: {total} productos, {alertas} alertas nuevas\n")
 
 
 def main():
-    cfg  = load_config()
-    con  = init_db()
+    cfg = load_config()
+    con = init_db()
     intervalo = cfg.get("intervalo_minutos", 30)
 
     if "--test" in sys.argv:
@@ -578,7 +547,7 @@ def main():
         return
 
     print(f"Monitor iniciado. Revisando cada {intervalo} min. (Ctrl+C para salir)\n")
-    enviar_ntfy(cfg, "Monitor iniciado", "El monitor de precios Falabella esta activo.")
+    enviar_ntfy(cfg, "Monitor iniciado", "El monitor de precios esta activo.")
     while True:
         try:
             revisar_una_vez(con, cfg)
@@ -588,7 +557,5 @@ def main():
         except Exception as e:
             print(f"  ! Error en el ciclo: {e}")
         time.sleep(intervalo * 60)
-
-
 if __name__ == "__main__":
     main()
