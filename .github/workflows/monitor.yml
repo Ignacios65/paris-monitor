@@ -51,6 +51,7 @@ jobs:
         env:
           NTFY_TEMA: ${{ secrets.NTFY_TEMA }}
           URLS: ${{ secrets.URLS }}
+          PARIS_TERMINOS: ${{ secrets.PARIS_TERMINOS }}
         run: python monitor.py --${{ github.event.inputs.modo || 'once' }}
 
       - name: Mantener repo activo
