@@ -48,7 +48,7 @@ jobs:
           key: precios-db
 
       - name: Correr monitor
-        env:
+               env:
           NTFY_TEMA: ${{ secrets.NTFY_TEMA }}
           URLS: ${{ secrets.URLS }}
           PARIS_TERMINOS: ${{ secrets.PARIS_TERMINOS }}
